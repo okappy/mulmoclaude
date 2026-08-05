@@ -99,6 +99,7 @@ import { mcpToolsRouter, mcpTools, isMcpToolEnabled } from "./agent/mcp-tools/in
 import { preflightUserServers, logPreflightResult } from "./agent/mcpPreflight.js";
 import { loadMcpConfig, loadSettings } from "./system/config.js";
 import { getVoiceInputStatus, stopWhisperSidecar, warmupVoiceInput } from "./system/whisper/index.js";
+import { evictAllSessions } from "./agent/backend/claudeSession.js";
 import { initWorkspace, workspacePath } from "./workspace/workspace.js";
 import { runMemoryMigrationOnce } from "./workspace/memory/run.js";
 import { runTopicMigrationOnce } from "./workspace/memory/topic-run.js";
@@ -1322,7 +1323,10 @@ async function startRuntimeServices(httpServer: ReturnType<typeof app.listen>, p
 // dead token. Crashes that skip this are harmless — see
 // plans/done/feat-bearer-token-auth.md; the next startup overwrites and
 // the stale file's token no longer matches the live in-memory one.
-const shutdownHooks: (() => void)[] = [stopWhisperSidecar];
+// `evictAllSessions` kills the per-chat `claude` CLI processes the agent pool
+// keeps warm between turns (server/agent/backend/claudeSession.ts). Without it
+// they outlive the server as orphans, each still holding its whole MCP fleet.
+const shutdownHooks: (() => void)[] = [stopWhisperSidecar, evictAllSessions];
 function registerShutdownHook(hook: () => void): void {
   shutdownHooks.push(hook);
 }

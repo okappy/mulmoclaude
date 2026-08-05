@@ -384,6 +384,58 @@ If a specific package keeps failing, build just it:
 `yarn workspace @mulmoclaude/<name> run build`. The build pipeline
 runs plugins before services so cross-package imports resolve cold.
 
+## Every reply takes 60-90 s, even a two-word one
+
+### Symptoms
+
+- Response time is roughly the same whether the user typed "hi" or a long
+  paragraph — it does not scale with the message.
+- The server log shows a large `durationMs=` on `[agent] request completed`
+  while the model's actual answer is short.
+- The first turn of a chat is slow and so is every turn after it.
+
+### Cause
+
+The `claude` CLI starts every MCP server the host has configured before it can
+answer. That includes the user's own global servers in `~/.claude.json` and any
+claude.ai connectors — MulmoClaude deliberately does not pass
+`--strict-mcp-config` (see `server/agent/config.ts`), so those all load. A
+server that is unreachable burns the full connect timeout (30 s each) before
+the turn can start.
+
+### Confirm it
+
+`claude mcp list` connects to every configured server and reports each one's
+status, so it measures exactly this cost with no inference involved:
+
+```bash
+cd ~/mulmoclaude && time claude mcp list
+```
+
+If that number is close to the per-turn `durationMs`, MCP startup is the cost,
+not the model. Any line reading `Failed to connect` / `connection timed out
+after 30000ms` is 30 s the user pays.
+
+### Fix
+
+1. Remove servers that cannot connect — each timeout is 30 s of dead wait:
+   `claude mcp remove <name> --scope user`. Common dead entries are hosts that
+   are no longer reachable and HTTP servers superseded by an `mcp-remote`
+   stdio proxy.
+2. Expect only the FIRST turn of a chat to pay this. MulmoClaude keeps the CLI
+   process alive between turns (`server/agent/backend/claudeSession.ts`), so
+   follow-up turns skip MCP startup entirely. `[agent] claude session acquired
+   reused=true` in the log confirms the warm path.
+3. If EVERY turn logs `reused=false`, the session is being respawned. The
+   fingerprint covers the system prompt and CLI args, so something is changing
+   between turns — a role switch, a plugin toggle, or a memory write. Run with
+   `--debug` to dump the system prompt and compare.
+
+Note that trimming one or two servers may just move the timeouts onto others:
+a host that cannot cold-start its whole MCP fleet within the 30 s window will
+show a different set of servers timing out each run. That is a signal to cut
+the fleet down, not to chase individual entries.
+
 ## Plugin runtime — install / drift
 
 ### Symptoms

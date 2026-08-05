@@ -47,6 +47,25 @@ export interface AgentInput {
   /** Whether the orchestrator detected a usable Docker sandbox.
    *  Backends that don't sandbox can ignore. */
   useDocker: boolean;
+  /** Per-turn MCP resources (config file + host-side stdio->HTTP shims)
+   *  that a backend keeping a live process past the turn must adopt.
+   *  Absent for backends the orchestrator runs without MCP. */
+  turnResources?: TurnResources | undefined;
+}
+
+/** Ownership handoff for resources the orchestrator creates per turn but a
+ *  persistent backend needs for the lifetime of its process.
+ *
+ *  The orchestrator tears these down after the turn UNLESS the backend sets
+ *  `retained`, which means the backend adopted THIS turn's resources and will
+ *  call `teardown` itself when its process dies. A backend that reused an
+ *  already-live process must leave `retained` false: the resources built for
+ *  this turn went unused and the orchestrator should drop them. */
+export interface TurnResources {
+  /** Release the MCP config file and any host-side MCP shims. Idempotent. */
+  readonly teardown: () => void;
+  /** Set by the backend when it takes ownership. */
+  retained: boolean;
 }
 
 export interface BackendCapabilities {

@@ -11,7 +11,7 @@
 import { claudeCodeBackend } from "./claude-code.js";
 import type { LLMBackend } from "./types.js";
 
-export type { AgentInput, BackendCapabilities, LLMBackend } from "./types.js";
+export type { AgentInput, BackendCapabilities, LLMBackend, TurnResources } from "./types.js";
 
 let activeBackend: LLMBackend = claudeCodeBackend;
 

@@ -53,3 +53,10 @@ export const SUBPROCESS_WORK_TIMEOUT_MS = ONE_MINUTE_MS;
 
 /** CLI subprocess timeout (claude -p for summarization, etc.) */
 export const CLI_SUBPROCESS_TIMEOUT_MS = 5 * ONE_MINUTE_MS;
+
+/** How long a chat's `claude` CLI process stays alive between turns before
+ *  it is evicted (server/agent/backend/claudeSession.ts). Long enough that a
+ *  user reading a reply and typing a follow-up still lands on the warm
+ *  process; short enough that abandoned chats don't hold a CLI process — and
+ *  its whole MCP fleet — indefinitely. */
+export const CLAUDE_SESSION_IDLE_MS = 10 * ONE_MINUTE_MS;

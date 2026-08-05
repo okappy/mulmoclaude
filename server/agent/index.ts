@@ -13,7 +13,7 @@ import type { Attachment } from "@mulmobridge/protocol";
 import type { AgentEvent } from "./stream.js";
 import { log } from "../system/logger/index.js";
 import { getActiveBackend } from "./backend/index.js";
-import type { AgentInput, LLMBackend } from "./backend/index.js";
+import type { AgentInput, LLMBackend, TurnResources } from "./backend/index.js";
 
 export interface RunAgentOptions {
   message: string;
@@ -38,6 +38,42 @@ export interface RunAgentInput {
   userTimezone?: string | undefined;
 }
 
+interface McpShim {
+  close: () => void;
+}
+
+/** The MCP config file and the host-side stdio→HTTP shims (#1421 Phase B) are
+ *  built per turn but must survive as long as whatever process is wired to
+ *  them. Bundle both behind one idempotent teardown so ownership can be handed
+ *  to a backend that keeps its process alive across turns
+ *  (server/agent/backend/claudeSession.ts) without splitting the cleanup. */
+interface OwnedTurnResources extends TurnResources {
+  /** Set once `prepareAgentRun` has decided whether this turn writes one. */
+  mcpConfigPath: string | null;
+}
+
+function createTurnResources(shims: McpShim[]): OwnedTurnResources {
+  let torndown = false;
+  const resources: OwnedTurnResources = {
+    mcpConfigPath: null,
+    retained: false,
+    teardown: () => {
+      if (torndown) return;
+      torndown = true;
+      if (resources.mcpConfigPath) unlink(resources.mcpConfigPath).catch(() => {});
+      for (const shim of shims) {
+        try {
+          shim.close();
+        } catch {
+          // close() is best-effort + idempotent; never let a teardown
+          // failure mask the turn's real outcome.
+        }
+      }
+    },
+  };
+  return resources;
+}
+
 export async function* runAgent(input: RunAgentInput): AsyncGenerator<AgentEvent> {
   const { role, workspacePath } = input;
   const activePlugins = getActivePlugins(role);
@@ -46,35 +82,24 @@ export async function* runAgent(input: RunAgentInput): AsyncGenerator<AgentEvent
   // Per-invocation read so Settings UI changes apply without a server restart.
   const userMcpRaw = loadMcpConfig().mcpServers;
   // `prepareUserServers` may spawn host-side stdio→HTTP gateways for
-  // opted-in servers (#1421 Phase B); `mcpShims` MUST be torn down
-  // in the finally below or host processes / ports leak.
+  // opted-in servers (#1421 Phase B); `mcpShims` are live host processes the
+  // moment this returns and MUST be torn down or host processes / ports leak.
   const { servers: userServers, shims: mcpShims } = await prepareUserServers(userMcpRaw, useDocker, workspacePath);
 
-  // Shims are live host processes the moment `prepareUserServers`
-  // returns. Wrap *all* subsequent setup (credential refresh, memory
-  // /prompt prep, MCP config write) so a throw before `runAgent` still
-  // tears them down — otherwise host processes / ports leak for the
-  // rest of the session.
+  // Covers *all* subsequent setup (credential refresh, memory / prompt prep,
+  // MCP config write) so a throw before `runAgent` still tears the shims down.
+  const resources = createTurnResources(mcpShims);
   try {
     const prepared = await prepareAgentRun(input, { activePlugins, useDocker, userServers });
-    try {
-      yield* prepared.backend.runAgent(prepared.agentInput);
-    } finally {
-      if (prepared.hasMcp) unlink(prepared.hostMcpPath).catch(() => {});
-    }
+    resources.mcpConfigPath = prepared.hasMcp ? prepared.hostMcpPath : null;
+    prepared.agentInput.turnResources = resources;
+    yield* prepared.backend.runAgent(prepared.agentInput);
   } finally {
-    // Tear down any host-side stdio→HTTP shims (#1421 Phase B) —
-    // real child processes holding ports. This outer finally also
-    // covers a throw during setup (before `runAgent`), which is the
-    // main leak risk of the opt-in escape hatch.
-    for (const shim of mcpShims) {
-      try {
-        shim.close();
-      } catch {
-        // close() is best-effort + idempotent; never let a teardown
-        // failure mask the turn's real outcome.
-      }
-    }
+    // `retained` means the backend adopted these for a process that outlives
+    // the turn and will call `teardown` when it dies. Otherwise they are ours
+    // to drop — including the case where the backend reused an already-live
+    // process and never wired this turn's copies up at all.
+    if (!resources.retained) resources.teardown();
   }
 }
 

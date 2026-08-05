@@ -9,8 +9,8 @@
 // home so the existing test suite under test/agent/ keeps working
 // unchanged.
 
-import { spawn, type ChildProcessByStdio } from "child_process";
-import type { Readable, Writable } from "stream";
+import { spawn } from "child_process";
+import { createHash } from "node:crypto";
 import { buildCliArgs, buildDockerSpawnArgs, buildUserMessageLine, resolveSystemPromptPaths, type CliArgsParams } from "../config.js";
 import { writeFileAtomic } from "../../utils/files/atomic.js";
 import { resolveSandboxAuth } from "../sandboxMounts.js";
@@ -23,9 +23,17 @@ import { errorMessage } from "../../utils/errors.js";
 import { EVENT_TYPES } from "../../../src/types/events.js";
 import { env } from "../../system/env.js";
 import { claudeBinPath } from "../../utils/claudeBin.js";
+import {
+  LinePump,
+  StderrCollector,
+  acquireSession,
+  evictSession,
+  releaseSession,
+  setStderrLogger,
+  type ClaudeProc,
+  type LiveSession,
+} from "./claudeSession.js";
 import type { AgentInput, LLMBackend } from "./types.js";
-
-type ClaudeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function spawnClaude(useDocker: boolean, workspacePath: string, cliArgs: string[], chatSessionId: string): ClaudeProc {
   if (!useDocker) {
@@ -147,25 +155,32 @@ function logAgentStderr(line: string): void {
   else log.error("agent-stderr", line);
 }
 
-async function* readAgentEvents(proc: ClaudeProc, abortSignal?: AbortSignal): AsyncGenerator<AgentEvent> {
-  let stderrOutput = "";
-  let stderrBuffer = "";
-  proc.stderr.on("data", (chunk: Buffer) => {
-    const text = chunk.toString();
-    stderrOutput += text;
-    stderrBuffer += text;
-    const lines = stderrBuffer.split("\n");
-    stderrBuffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.trim()) logAgentStderr(line);
-    }
-  });
+// Classification lives here (isBenignClaudeStderr), the pool owns the
+// streams — hand the router over rather than have the pool import this file.
+setStderrLogger(logAgentStderr);
 
+/** Resolve once the process is really gone. Returns immediately when it
+ *  already exited, so the crash path never hangs on a `close` that fired
+ *  before we started listening. */
+function awaitClose(proc: ClaudeProc): Promise<{ code: number | null; signal: string | null }> {
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    return Promise.resolve({ code: proc.exitCode, signal: proc.signalCode });
+  }
+  return new Promise((resolve) => proc.once("close", (code, sig) => resolve({ code, signal: sig })));
+}
+
+/** Drain one user turn's worth of events.
+ *
+ *  A turn ends at the stream-json `result` event, NOT at process exit — the
+ *  process outlives the turn so the next one skips MCP startup. Running out of
+ *  stdout instead means the CLI died mid-turn, which is the crash path.
+ *
+ *  Returns true when the turn completed normally (process still usable). */
+async function* readTurnEvents(session: LiveSession, abortSignal: AbortSignal | undefined, outcome: { completed: boolean }): AsyncGenerator<AgentEvent> {
   // Stateful parser tracks whether text was already streamed via
   // assistant content blocks so the final `result` event's duplicate
   // text is suppressed. See createStreamParser() in stream.ts.
   const parser = createStreamParser();
-
   const mcpTracker = createMcpTracker();
   // Runtime failure monitor (#1353). Lives next to mcpTracker
   // because they share the same event stream — the tracker spots
@@ -173,39 +188,34 @@ async function* readAgentEvents(proc: ClaudeProc, abortSignal?: AbortSignal): As
   // "MCP invoked but consistently failing" pattern.
   const mcpFailureMonitor = createMcpFailureMonitor();
 
-  // Attach the close listener BEFORE draining stdout. The `close` event
-  // can fire on the same tick stdout ends; registering it only after the
-  // read loop risks missing it and hanging on the await below.
-  const closed = new Promise<{ code: number | null; signal: string | null }>((resolve) => proc.on("close", (code, sig) => resolve({ code, signal: sig })));
-
-  let buffer = "";
-  for await (const chunk of proc.stdout) {
-    buffer += String(chunk);
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let event: RawStreamEvent;
-      try {
-        event = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      for (const agentEvent of parser.parse(event)) {
-        mcpTracker.track(agentEvent);
-        mcpFailureMonitor.track(agentEvent);
-        yield agentEvent;
-      }
+  for (;;) {
+    const line = await session.stdout.next();
+    if (line === null) break;
+    let event: RawStreamEvent;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const agentEvent of parser.parse(event)) {
+      mcpTracker.track(agentEvent);
+      mcpFailureMonitor.track(agentEvent);
+      yield agentEvent;
+    }
+    if (event.type === "result") {
+      outcome.completed = true;
+      mcpTracker.logIfSuspicious();
+      return;
     }
   }
 
-  const { code: exitCode, signal } = await closed;
-
-  if (stderrBuffer.trim()) logAgentStderr(stderrBuffer);
+  // stdout ended without a `result` — the CLI died mid-turn.
+  const { code: exitCode, signal } = await awaitClose(session.proc);
+  session.stderr.flush();
   log.info("agent", "claude exited", { exitCode, signal });
   mcpTracker.logIfSuspicious();
 
+  const stderrOutput = session.stderr.text();
   const errorEvent = buildExitErrorEvent(exitCode, signal, abortSignal, stderrOutput) ?? brokerNotReadyErrorEvent(stderrOutput);
   if (errorEvent) yield errorEvent;
 }
@@ -242,75 +252,122 @@ export async function writeSystemPromptFile(input: AgentInput): Promise<string> 
   return paths.argPath;
 }
 
-async function* runClaudeAgent(input: AgentInput): AsyncGenerator<AgentEvent> {
-  const systemPromptPath = await writeSystemPromptFile(input);
-  const cliArgs = buildCliArgs(cliArgsForInput(input, systemPromptPath));
+// Everything the CLI fixes at spawn time. A change here cannot be applied to a
+// live process, so it must force a respawn: a stale system prompt (wrong role,
+// wrong plugin set, stale memory snapshot) is worse than one cold turn.
+export function sessionFingerprint(input: AgentInput, cliArgs: string[]): string {
+  // --resume carries the CLI session id, which legitimately changes between
+  // the first and second turn of a chat. Excluding it is what lets turn 2
+  // reuse turn 1's process.
+  const stable: string[] = [];
+  for (let i = 0; i < cliArgs.length; i++) {
+    if (cliArgs[i] === "--resume") {
+      i++;
+      continue;
+    }
+    stable.push(cliArgs[i] ?? "");
+  }
+  const material = JSON.stringify([input.systemPrompt, stable, input.workspacePath, input.useDocker]);
+  return createHash("sha256").update(material).digest("hex");
+}
 
-  // spawnClaude can throw synchronously when `claudeBinPath()` fails
-  // to locate `claude.exe` on Windows — surface that through the same
-  // AgentEvent error channel as the post-spawn "error" event so the
-  // server stays alive (#1364) and the user sees the actionable
-  // "install with npm install -g …" hint.
-  let proc: ReturnType<typeof spawnClaude>;
+function spawnFailureEvent(useDocker: boolean, err: unknown, phase: "resolve" | "spawn"): AgentEvent {
+  const target = useDocker ? "docker" : "claude";
+  const message = errorMessage(err);
+  log.error("agent", `failed to ${phase} ${target}${phase === "resolve" ? " binary" : ""}`, { error: message });
+  return { type: EVENT_TYPES.error, message: `Failed to spawn ${target}: ${message}` };
+}
+
+// Docker keeps the original one-process-per-turn shape: a persistent container
+// per chat has its own teardown semantics and is out of scope here (see
+// plans/perf-persistent-claude-session.md). `useDocker` is part of the
+// fingerprint, so the two paths can never share a process.
+async function* runDockerTurn(input: AgentInput, cliArgs: string[]): AsyncGenerator<AgentEvent> {
+  let proc: ClaudeProc;
   try {
-    proc = spawnClaude(input.useDocker, input.workspacePath, cliArgs, input.sessionId);
+    proc = spawnClaude(true, input.workspacePath, cliArgs, input.sessionId);
   } catch (err) {
-    const target = input.useDocker ? "docker" : "claude";
-    const message = err instanceof Error ? err.message : String(err);
-    log.error("agent", `failed to resolve ${target} binary`, { error: message });
-    yield {
-      type: EVENT_TYPES.error,
-      message: `Failed to spawn ${target}: ${message}`,
-    };
+    yield spawnFailureEvent(true, err, "resolve");
     return;
   }
-
-  // Wait for the kernel to confirm the spawn before piping anything
-  // into stdin. Without this guard, a missing `claude` (or `docker`)
-  // binary emits a delayed `error` event with no listener attached —
-  // Node treats it as uncaught and tears down the entire server
-  // process. Surfacing it as a regular AgentEvent keeps the server
-  // alive across CI runs and prod-misconfig recovery (#1364).
   try {
     await new Promise<void>((resolve, reject) => {
       proc.once("spawn", () => resolve());
       proc.once("error", (err) => reject(err));
     });
   } catch (err) {
-    const target = input.useDocker ? "docker" : "claude";
-    const message = errorMessage(err);
-    log.error("agent", `failed to spawn ${target}`, { error: message });
-    yield {
-      type: EVENT_TYPES.error,
-      message: `Failed to spawn ${target}: ${message}`,
-    };
+    yield spawnFailureEvent(true, err, "spawn");
     return;
   }
-  // Best-effort stdin EPIPE guard — the process can die between
-  // `spawn` and the write below for unrelated reasons (OOM, kill
-  // -9), and we don't want a write-after-death to become another
-  // uncaught error.
   proc.stdin.on("error", () => {});
-
-  // stream-json input mode: stream the user turn as a single JSON
-  // line to stdin, then close the pipe so the CLI knows no further
-  // turns are coming. Writing before attaching the abort handler is
-  // fine — if the write fails because the process already died for
-  // other reasons, the readAgentEvents loop below surfaces it.
-  const messageLine = await buildUserMessageLine(input.message, input.attachments);
-  proc.stdin.write(messageLine);
+  const session: LiveSession = {
+    proc,
+    stdout: new LinePump(proc.stdout),
+    stderr: new StderrCollector(proc.stderr, logAgentStderr),
+  };
+  proc.stdin.write(await buildUserMessageLine(input.message, input.attachments));
   proc.stdin.end();
 
   const onAbort = () => {
     if (!proc.killed) proc.kill();
   };
   input.abortSignal?.addEventListener("abort", onAbort, { once: true });
-
   try {
-    yield* readAgentEvents(proc, input.abortSignal);
+    yield* readTurnEvents(session, input.abortSignal, { completed: false });
   } finally {
     input.abortSignal?.removeEventListener("abort", onAbort);
     if (!proc.killed) proc.kill();
+  }
+}
+
+async function* runClaudeAgent(input: AgentInput): AsyncGenerator<AgentEvent> {
+  const systemPromptPath = await writeSystemPromptFile(input);
+  const cliArgs = buildCliArgs(cliArgsForInput(input, systemPromptPath));
+
+  if (input.useDocker) {
+    yield* runDockerTurn(input, cliArgs);
+    return;
+  }
+
+  const resources = input.turnResources;
+  let acquired: Awaited<ReturnType<typeof acquireSession>>;
+  try {
+    acquired = await acquireSession({
+      key: input.sessionId,
+      fingerprint: sessionFingerprint(input, cliArgs),
+      // Throws synchronously when `claudeBinPath()` cannot find claude.exe on
+      // Windows — surfaced as an AgentEvent so the server stays alive (#1364)
+      // and the user sees the "install with npm install -g …" hint.
+      spawn: () => spawnClaude(false, input.workspacePath, cliArgs, input.sessionId),
+      teardown: () => resources?.teardown(),
+    });
+  } catch (err) {
+    yield spawnFailureEvent(false, err, "spawn");
+    return;
+  }
+  // A fresh process adopts THIS turn's MCP config + shims for its whole life.
+  // A reused one already owns an equivalent set, so the orchestrator drops the
+  // ones it just built (they were never wired up).
+  if (resources && !acquired.reused) resources.retained = true;
+  log.info("agent", "claude session acquired", { reused: acquired.reused });
+
+  const { session } = acquired;
+  session.proc.stdin.write(await buildUserMessageLine(input.message, input.attachments));
+
+  // Abort ends the whole session rather than just the turn: the CLI has no
+  // mid-turn interrupt over stdin, and a half-drained stream would corrupt the
+  // next turn. The next message respawns and picks the conversation back up
+  // via --resume.
+  const onAbort = () => evictSession(input.sessionId, "abort");
+  input.abortSignal?.addEventListener("abort", onAbort, { once: true });
+
+  const outcome = { completed: false };
+  try {
+    yield* readTurnEvents(session, input.abortSignal, outcome);
+  } finally {
+    input.abortSignal?.removeEventListener("abort", onAbort);
+    if (outcome.completed) releaseSession(input.sessionId);
+    else evictSession(input.sessionId, "crash");
   }
 }
 
